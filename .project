@@ -31,11 +31,6 @@
 	</natures>
 	<linkedResources>
 		<link>
-			<name>L151_second.ioc</name>
-			<type>1</type>
-			<locationURI>PARENT-1-PROJECT_LOC/L151_second.ioc</locationURI>
-		</link>
-		<link>
 			<name>Application/User/stm32l1xx_hal_msp.c</name>
 			<type>1</type>
 			<locationURI>PARENT-1-PROJECT_LOC/Src/stm32l1xx_hal_msp.c</locationURI>
