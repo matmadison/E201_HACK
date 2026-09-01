@@ -448,10 +448,36 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
+  /* Encoder Z/reference input: ENC_Z is connected to PB4. */
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* Keep USB at the higher interrupt priority. */
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+/* PB4 has its own EXTI interrupt vector on the STM32L151. */
+void EXTI4_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_4)
+  {
+    /* Reset the live TIM2 encoder count on the rising edge of Z. */
+    __HAL_TIM_SET_COUNTER(&htim2, 0U);
+  }
+}
 
 /* USER CODE END 4 */
 
@@ -485,3 +511,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
