@@ -22,6 +22,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "usbd_cdc_if.h"
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -32,6 +34,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define TIMESTAMP_INTERVAL_FRAMES  1000U
+#define USB_TX_BUFFER_CAPACITY     1024U
 
 /* USER CODE END PD */
 
@@ -45,6 +50,20 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 
+extern volatile uint8_t active_encoder_count;
+extern volatile uint8_t usb_stream_enabled;
+extern volatile uint16_t usb_tx_batch_size;
+extern volatile uint16_t usb_flush_threshold;
+extern volatile uint8_t usb_force_flush_ms;
+
+static uint8_t encoder_frame[10];
+static uint8_t timestamp_frame[6];
+static uint8_t usb_tx_buffer[2][USB_TX_BUFFER_CAPACITY];
+static uint8_t usb_fill_buffer = 0U;
+static uint16_t usb_fill_length = 0U;
+static uint32_t usb_fill_started_ms = 0U;
+static uint32_t encoder_frame_count = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -53,10 +72,187 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
+static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity);
+static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms);
+static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
+                               uint32_t now);
+static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush);
+static void USB_StreamTask(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity)
+{
+  uint8_t count = active_encoder_count;
+  uint8_t checksum = 0U;
+  uint8_t i;
+  uint16_t frame_length;
+  uint16_t encoder_count =
+      (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+
+  if (count < 1U) count = 1U;
+  if (count > 4U) count = 4U;
+
+  frame_length = (uint16_t)(2U + (2U * count));
+  if ((frame == NULL) || (capacity < frame_length))
+  {
+    return 0U;
+  }
+
+  frame[0] = 0xA5U;
+  frame[1] = (uint8_t)(encoder_count & 0xFFU);
+  frame[2] = (uint8_t)((encoder_count >> 8) & 0xFFU);
+
+  /* This board has one encoder. Pad E2..E4 with zero if selected by mistake. */
+  for (i = 1U; i < count; i++)
+  {
+    frame[1U + (2U * i)] = 0U;
+    frame[2U + (2U * i)] = 0U;
+  }
+
+  for (i = 0U; i < (frame_length - 1U); i++)
+  {
+    checksum ^= frame[i];
+  }
+  frame[frame_length - 1U] = (uint8_t)(checksum ^ 0xFFU);
+
+  return frame_length;
+}
+
+static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms)
+{
+  uint8_t checksum = 0U;
+  uint8_t i;
+
+  frame[0] = 0xAAU;
+  frame[1] = (uint8_t)(tick_ms & 0xFFU);
+  frame[2] = (uint8_t)((tick_ms >> 8) & 0xFFU);
+  frame[3] = (uint8_t)((tick_ms >> 16) & 0xFFU);
+  frame[4] = (uint8_t)((tick_ms >> 24) & 0xFFU);
+
+  for (i = 0U; i < 5U; i++)
+  {
+    checksum ^= frame[i];
+  }
+  frame[5] = (uint8_t)(checksum ^ 0xFFU);
+}
+
+static uint16_t USB_GetBatchSize(void)
+{
+  uint16_t batch_size = usb_tx_batch_size;
+
+  if (batch_size < 16U) batch_size = 16U;
+  if (batch_size > USB_TX_BUFFER_CAPACITY)
+  {
+    batch_size = USB_TX_BUFFER_CAPACITY;
+  }
+  return batch_size;
+}
+
+static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush)
+{
+  uint16_t batch_size = USB_GetBatchSize();
+  uint16_t threshold = usb_flush_threshold;
+  uint8_t force_ms = usb_force_flush_ms;
+
+  if (usb_fill_length == 0U)
+  {
+    return 1U;
+  }
+
+  if (threshold < 1U) threshold = 1U;
+  if (threshold > batch_size) threshold = batch_size;
+  if (force_ms < 1U) force_ms = 1U;
+  if (force_ms > 20U) force_ms = 20U;
+
+  if ((force_flush == 0U) &&
+      (usb_fill_length < threshold) &&
+      ((now - usb_fill_started_ms) < force_ms))
+  {
+    return 0U;
+  }
+
+  if (CDC_Transmit_FS(usb_tx_buffer[usb_fill_buffer],
+                      usb_fill_length) == USBD_OK)
+  {
+    /* The other buffer is safe to fill while this buffer is transmitted. */
+    usb_fill_buffer ^= 1U;
+    usb_fill_length = 0U;
+    usb_fill_started_ms = 0U;
+    return 1U;
+  }
+
+  return 0U;
+}
+
+static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
+                               uint32_t now)
+{
+  uint16_t batch_size = USB_GetBatchSize();
+
+  if ((frame == NULL) || (length == 0U) || (length > batch_size))
+  {
+    return 0U;
+  }
+
+  if ((usb_fill_length + length) > batch_size)
+  {
+    (void)USB_TryFlush(now, 1U);
+    if ((usb_fill_length + length) > batch_size)
+    {
+      return 0U;
+    }
+  }
+
+  if (usb_fill_length == 0U)
+  {
+    usb_fill_started_ms = now;
+  }
+
+  memcpy(&usb_tx_buffer[usb_fill_buffer][usb_fill_length], frame, length);
+  usb_fill_length += length;
+  return 1U;
+}
+
+static void USB_StreamTask(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint8_t timestamp_sent = 0U;
+
+  if (usb_stream_enabled == 0U)
+  {
+    usb_fill_length = 0U;
+    usb_fill_started_ms = 0U;
+    encoder_frame_count = 0U;
+    return;
+  }
+
+  if (encoder_frame_count >= TIMESTAMP_INTERVAL_FRAMES)
+  {
+    APP_BuildTimestampFrame(timestamp_frame, now);
+    if (USB_AppendFrame(timestamp_frame, sizeof(timestamp_frame), now) != 0U)
+    {
+      encoder_frame_count = 0U;
+      timestamp_sent = 1U;
+    }
+  }
+  else
+  {
+    uint16_t frame_length =
+        APP_BuildEncoderFrame(encoder_frame, sizeof(encoder_frame));
+
+    if ((frame_length != 0U) &&
+        (USB_AppendFrame(encoder_frame, frame_length, now) != 0U))
+    {
+      encoder_frame_count++;
+    }
+  }
+
+  (void)USB_TryFlush(now, timestamp_sent);
+}
 
 /* USER CODE END 0 */
 
@@ -93,6 +289,25 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
+  /* Allow USB to initialise before powering the encoder. */
+  HAL_Delay(500);
+
+  /* Encoder power ON: pull the PB10 open-drain output low. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+
+  /* Allow the encoder supply to settle, then start TIM2 encoder mode. */
+  HAL_Delay(100);
+  if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  __HAL_TIM_SET_COUNTER(&htim2, 0U);
+  usb_fill_buffer = 0U;
+  usb_fill_length = 0U;
+  usb_fill_started_ms = 0U;
+  encoder_frame_count = 0U;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -102,6 +317,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    USB_StreamTask();
   }
   /* USER CODE END 3 */
 }
@@ -214,8 +430,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+  /* Configure PB10 initially released: encoder power OFF. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PA2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
@@ -225,7 +441,7 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : PB10 */
   GPIO_InitStruct.Pin = GPIO_PIN_10;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);

@@ -32,6 +32,25 @@
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 
+/* Runtime settings shared with main.c. */
+volatile uint8_t active_encoder_count = 1U;
+volatile uint8_t usb_stream_enabled = 1U;
+volatile uint16_t usb_tx_batch_size = 240U;
+volatile uint16_t usb_flush_threshold = 48U;
+volatile uint8_t usb_force_flush_ms = 1U;
+
+/* Recorder control-command parser state. */
+static uint8_t active_cmd_state = 0U;
+static uint8_t active_cmd_count = 1U;
+static uint8_t stream_cmd_state = 0U;
+static uint8_t stream_cmd_value = 0U;
+static uint8_t tune_cmd_state = 0U;
+static uint8_t tune_cmd_buf[5];
+
+#define ACTIVE_ENCODER_CMD_HEADER  0xC3U
+#define STREAM_CONTROL_CMD_HEADER  0xC4U
+#define USB_TUNING_CMD_HEADER      0xC5U
+
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -259,6 +278,126 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  uint32_t i;
+
+  if ((Buf != NULL) && (Len != NULL))
+  {
+    for (i = 0U; i < *Len; i++)
+    {
+      uint8_t b = Buf[i];
+
+      /* C5 batch_L batch_H threshold_L threshold_H force_ms checksum */
+      if ((tune_cmd_state >= 1U) && (tune_cmd_state <= 5U))
+      {
+        tune_cmd_buf[tune_cmd_state - 1U] = b;
+        tune_cmd_state++;
+        continue;
+      }
+      else if (tune_cmd_state == 6U)
+      {
+        uint8_t expected = USB_TUNING_CMD_HEADER;
+        uint8_t k;
+        uint16_t batch;
+        uint16_t threshold;
+        uint8_t force_ms;
+
+        for (k = 0U; k < 5U; k++)
+        {
+          expected ^= tune_cmd_buf[k];
+        }
+        expected ^= 0xFFU;
+
+        if (b == expected)
+        {
+          batch = (uint16_t)tune_cmd_buf[0] |
+                  ((uint16_t)tune_cmd_buf[1] << 8);
+          threshold = (uint16_t)tune_cmd_buf[2] |
+                      ((uint16_t)tune_cmd_buf[3] << 8);
+          force_ms = tune_cmd_buf[4];
+
+          if ((batch >= 16U) && (batch <= 1024U) &&
+              (threshold >= 1U) && (threshold <= batch) &&
+              (force_ms >= 1U) && (force_ms <= 20U))
+          {
+            usb_tx_batch_size = batch;
+            usb_flush_threshold = threshold;
+            usb_force_flush_ms = force_ms;
+          }
+        }
+
+        tune_cmd_state = 0U;
+        continue;
+      }
+
+      /* C3 active_encoder_count checksum */
+      if (active_cmd_state == 1U)
+      {
+        if ((b >= 1U) && (b <= 4U))
+        {
+          active_cmd_count = b;
+          active_cmd_state = 2U;
+        }
+        else
+        {
+          active_cmd_state = 0U;
+        }
+        continue;
+      }
+      else if (active_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((ACTIVE_ENCODER_CMD_HEADER ^ active_cmd_count) ^ 0xFFU);
+
+        if (b == expected)
+        {
+          active_encoder_count = active_cmd_count;
+        }
+        active_cmd_state = 0U;
+        continue;
+      }
+
+      /* C4 enabled checksum */
+      if (stream_cmd_state == 1U)
+      {
+        if (b <= 1U)
+        {
+          stream_cmd_value = b;
+          stream_cmd_state = 2U;
+        }
+        else
+        {
+          stream_cmd_state = 0U;
+        }
+        continue;
+      }
+      else if (stream_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((STREAM_CONTROL_CMD_HEADER ^ stream_cmd_value) ^ 0xFFU);
+
+        if (b == expected)
+        {
+          usb_stream_enabled = stream_cmd_value;
+        }
+        stream_cmd_state = 0U;
+        continue;
+      }
+
+      if (b == ACTIVE_ENCODER_CMD_HEADER)
+      {
+        active_cmd_state = 1U;
+      }
+      else if (b == STREAM_CONTROL_CMD_HEADER)
+      {
+        stream_cmd_state = 1U;
+      }
+      else if (b == USB_TUNING_CMD_HEADER)
+      {
+        tune_cmd_state = 1U;
+      }
+    }
+  }
+
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
@@ -280,8 +419,21 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hcdc->TxState != 0){
+  USBD_CDC_HandleTypeDef *hcdc;
+
+  if ((Buf == NULL) || (Len == 0U))
+  {
+    return USBD_FAIL;
+  }
+
+  if (hUsbDeviceFS.pClassData == NULL)
+  {
+    return USBD_BUSY;
+  }
+
+  hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+  if (hcdc->TxState != 0U)
+  {
     return USBD_BUSY;
   }
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
@@ -301,3 +453,4 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 /**
   * @}
   */
+
