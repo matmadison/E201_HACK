@@ -23,6 +23,8 @@
 
 /* USER CODE BEGIN INCLUDE */
 
+#include "main.h"
+
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,10 +48,16 @@ static uint8_t stream_cmd_state = 0U;
 static uint8_t stream_cmd_value = 0U;
 static uint8_t tune_cmd_state = 0U;
 static uint8_t tune_cmd_buf[5];
+static uint8_t reference_cmd_state = 0U;
+static uint8_t reference_cmd_value = 1U;
+static uint8_t pc_reset_cmd_state = 0U;
+static uint8_t pc_reset_cmd_value = 0U;
 
 #define ACTIVE_ENCODER_CMD_HEADER  0xC3U
 #define STREAM_CONTROL_CMD_HEADER  0xC4U
 #define USB_TUNING_CMD_HEADER      0xC5U
+#define REFERENCE_RESET_CMD_HEADER 0xC6U
+#define PC_COUNTER_RESET_CMD_HEADER 0xC7U
 
 /* USER CODE END PV */
 
@@ -383,6 +391,60 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
         continue;
       }
 
+      /* C6 enabled checksum: select whether PA2 reference resets TIM2. */
+      if (reference_cmd_state == 1U)
+      {
+        if (b <= 1U)
+        {
+          reference_cmd_value = b;
+          reference_cmd_state = 2U;
+        }
+        else
+        {
+          reference_cmd_state = 0U;
+        }
+        continue;
+      }
+      else if (reference_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((REFERENCE_RESET_CMD_HEADER ^ reference_cmd_value) ^ 0xFFU);
+
+        if (b == expected)
+        {
+          APP_SetReferenceResetEnabled(reference_cmd_value);
+        }
+        reference_cmd_state = 0U;
+        continue;
+      }
+
+      /* C7 1 checksum: zero TIM2 and report a PC reset event in the stream. */
+      if (pc_reset_cmd_state == 1U)
+      {
+        if (b == 1U)
+        {
+          pc_reset_cmd_value = b;
+          pc_reset_cmd_state = 2U;
+        }
+        else
+        {
+          pc_reset_cmd_state = 0U;
+        }
+        continue;
+      }
+      else if (pc_reset_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((PC_COUNTER_RESET_CMD_HEADER ^ pc_reset_cmd_value) ^ 0xFFU);
+
+        if (b == expected)
+        {
+          APP_ResetEncoderFromPC();
+        }
+        pc_reset_cmd_state = 0U;
+        continue;
+      }
+
       if (b == ACTIVE_ENCODER_CMD_HEADER)
       {
         active_cmd_state = 1U;
@@ -394,6 +456,14 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       else if (b == USB_TUNING_CMD_HEADER)
       {
         tune_cmd_state = 1U;
+      }
+      else if (b == REFERENCE_RESET_CMD_HEADER)
+      {
+        reference_cmd_state = 1U;
+      }
+      else if (b == PC_COUNTER_RESET_CMD_HEADER)
+      {
+        pc_reset_cmd_state = 1U;
       }
     }
   }

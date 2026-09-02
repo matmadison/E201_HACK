@@ -54,6 +54,9 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 
+void APP_SetReferenceResetEnabled(uint8_t enabled);
+void APP_ResetEncoderFromPC(void);
+
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

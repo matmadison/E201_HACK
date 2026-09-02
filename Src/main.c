@@ -37,6 +37,10 @@
 
 #define TIMESTAMP_INTERVAL_FRAMES  1000U
 #define USB_TX_BUFFER_CAPACITY     1024U
+#define COUNTER_EVENT_HEADER       0xABU
+#define COUNTER_EVENT_PHYSICAL_RESET     1U
+#define COUNTER_EVENT_PHYSICAL_NO_RESET  2U
+#define COUNTER_EVENT_PC_RESET           3U
 
 /* USER CODE END PD */
 
@@ -58,11 +62,15 @@ extern volatile uint8_t usb_force_flush_ms;
 
 static uint8_t encoder_frame[10];
 static uint8_t timestamp_frame[6];
+static uint8_t counter_event_frame[4];
 static uint8_t usb_tx_buffer[2][USB_TX_BUFFER_CAPACITY];
 static uint8_t usb_fill_buffer = 0U;
 static uint16_t usb_fill_length = 0U;
 static uint32_t usb_fill_started_ms = 0U;
 static uint32_t encoder_frame_count = 0U;
+static volatile uint8_t reference_reset_enabled = 1U;
+static volatile uint8_t counter_event_pending = 0U;
+static volatile uint8_t counter_event_type = 0U;
 
 /* USER CODE END PV */
 
@@ -74,6 +82,7 @@ static void MX_TIM2_Init(void);
 
 static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity);
 static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms);
+static void APP_BuildCounterEventFrame(uint8_t *frame, uint8_t event_type);
 static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
                                uint32_t now);
 static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush);
@@ -138,6 +147,18 @@ static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms)
     checksum ^= frame[i];
   }
   frame[5] = (uint8_t)(checksum ^ 0xFFU);
+}
+
+static void APP_BuildCounterEventFrame(uint8_t *frame, uint8_t event_type)
+{
+  uint8_t checksum;
+
+  /* AB event_type encoder_mask checksum.  This L151 board has E1 only. */
+  frame[0] = COUNTER_EVENT_HEADER;
+  frame[1] = event_type;
+  frame[2] = 0x01U;
+  checksum = (uint8_t)(frame[0] ^ frame[1] ^ frame[2]);
+  frame[3] = (uint8_t)(checksum ^ 0xFFU);
 }
 
 static uint16_t USB_GetBatchSize(void)
@@ -221,12 +242,36 @@ static void USB_StreamTask(void)
 {
   uint32_t now = HAL_GetTick();
   uint8_t timestamp_sent = 0U;
+  uint8_t pending_event_type = 0U;
 
   if (usb_stream_enabled == 0U)
   {
     usb_fill_length = 0U;
     usb_fill_started_ms = 0U;
     encoder_frame_count = 0U;
+    return;
+  }
+
+  /* Counter events are inserted before the first post-event encoder sample. */
+  __disable_irq();
+  if (counter_event_pending != 0U)
+  {
+    pending_event_type = counter_event_type;
+    counter_event_pending = 0U;
+  }
+  __enable_irq();
+
+  if (pending_event_type != 0U)
+  {
+    APP_BuildCounterEventFrame(counter_event_frame, pending_event_type);
+    if (USB_AppendFrame(counter_event_frame, sizeof(counter_event_frame), now) == 0U)
+    {
+      __disable_irq();
+      counter_event_type = pending_event_type;
+      counter_event_pending = 1U;
+      __enable_irq();
+    }
+    (void)USB_TryFlush(now, 1U);
     return;
   }
 
@@ -457,12 +502,39 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void APP_SetReferenceResetEnabled(uint8_t enabled)
+{
+  reference_reset_enabled = (enabled != 0U) ? 1U : 0U;
+}
+
+void APP_ResetEncoderFromPC(void)
+{
+  uint32_t interrupt_was_disabled = __get_PRIMASK();
+
+  __disable_irq();
+  __HAL_TIM_SET_COUNTER(&htim2, 0U);
+  counter_event_type = COUNTER_EVENT_PC_RESET;
+  counter_event_pending = 1U;
+  if (interrupt_was_disabled == 0U)
+  {
+    __enable_irq();
+  }
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_2)
   {
-    /* Reset the live TIM2 encoder count on the rising edge of ENC_Z. */
-    __HAL_TIM_SET_COUNTER(&htim2, 0U);
+    if (reference_reset_enabled != 0U)
+    {
+      __HAL_TIM_SET_COUNTER(&htim2, 0U);
+      counter_event_type = COUNTER_EVENT_PHYSICAL_RESET;
+    }
+    else
+    {
+      counter_event_type = COUNTER_EVENT_PHYSICAL_NO_RESET;
+    }
+    counter_event_pending = 1U;
   }
 }
 
