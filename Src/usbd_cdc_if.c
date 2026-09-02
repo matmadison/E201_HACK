@@ -37,9 +37,10 @@
 /* Runtime settings shared with main.c. */
 volatile uint8_t active_encoder_count = 1U;
 volatile uint8_t usb_stream_enabled = 1U;
-volatile uint16_t usb_tx_batch_size = 240U;
-volatile uint16_t usb_flush_threshold = 48U;
+volatile uint16_t usb_tx_batch_size = 512U;
+volatile uint16_t usb_flush_threshold = 512U;
 volatile uint8_t usb_force_flush_ms = 1U;
+volatile uint32_t timestamp_interval_frames = 1000U;
 
 /* Recorder control-command parser state. */
 static uint8_t active_cmd_state = 0U;
@@ -52,12 +53,15 @@ static uint8_t reference_cmd_state = 0U;
 static uint8_t reference_cmd_value = 1U;
 static uint8_t pc_reset_cmd_state = 0U;
 static uint8_t pc_reset_cmd_value = 0U;
+static uint8_t timestamp_cmd_state = 0U;
+static uint8_t timestamp_cmd_buf[4];
 
 #define ACTIVE_ENCODER_CMD_HEADER  0xC3U
 #define STREAM_CONTROL_CMD_HEADER  0xC4U
 #define USB_TUNING_CMD_HEADER      0xC5U
 #define REFERENCE_RESET_CMD_HEADER 0xC6U
 #define PC_COUNTER_RESET_CMD_HEADER 0xC7U
+#define TIMESTAMP_INTERVAL_CMD_HEADER 0xC8U
 
 /* USER CODE END PV */
 
@@ -337,6 +341,42 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
         continue;
       }
 
+      /* C8 interval_0 interval_1 interval_2 interval_3 checksum. */
+      if ((timestamp_cmd_state >= 1U) && (timestamp_cmd_state <= 4U))
+      {
+        timestamp_cmd_buf[timestamp_cmd_state - 1U] = b;
+        timestamp_cmd_state++;
+        continue;
+      }
+      else if (timestamp_cmd_state == 5U)
+      {
+        uint8_t expected = TIMESTAMP_INTERVAL_CMD_HEADER;
+        uint8_t k;
+        uint32_t interval;
+
+        for (k = 0U; k < 4U; k++)
+        {
+          expected ^= timestamp_cmd_buf[k];
+        }
+        expected ^= 0xFFU;
+
+        if (b == expected)
+        {
+          interval = (uint32_t)timestamp_cmd_buf[0] |
+                     ((uint32_t)timestamp_cmd_buf[1] << 8) |
+                     ((uint32_t)timestamp_cmd_buf[2] << 16) |
+                     ((uint32_t)timestamp_cmd_buf[3] << 24);
+
+          if (interval >= 1U)
+          {
+            timestamp_interval_frames = interval;
+          }
+        }
+
+        timestamp_cmd_state = 0U;
+        continue;
+      }
+
       /* C3 active_encoder_count checksum */
       if (active_cmd_state == 1U)
       {
@@ -464,6 +504,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       else if (b == PC_COUNTER_RESET_CMD_HEADER)
       {
         pc_reset_cmd_state = 1U;
+      }
+      else if (b == TIMESTAMP_INTERVAL_CMD_HEADER)
+      {
+        timestamp_cmd_state = 1U;
       }
     }
   }

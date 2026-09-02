@@ -35,7 +35,6 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define TIMESTAMP_INTERVAL_FRAMES  1000U
 #define USB_TX_BUFFER_CAPACITY     1024U
 #define COUNTER_EVENT_HEADER       0xABU
 #define COUNTER_EVENT_PHYSICAL_RESET     1U
@@ -59,6 +58,7 @@ extern volatile uint8_t usb_stream_enabled;
 extern volatile uint16_t usb_tx_batch_size;
 extern volatile uint16_t usb_flush_threshold;
 extern volatile uint8_t usb_force_flush_ms;
+extern volatile uint32_t timestamp_interval_frames;
 
 static uint8_t encoder_frame[10];
 static uint8_t timestamp_frame[6];
@@ -275,7 +275,7 @@ static void USB_StreamTask(void)
     return;
   }
 
-  if (encoder_frame_count >= TIMESTAMP_INTERVAL_FRAMES)
+  if (encoder_frame_count >= timestamp_interval_frames)
   {
     APP_BuildTimestampFrame(timestamp_frame, now);
     if (USB_AppendFrame(timestamp_frame, sizeof(timestamp_frame), now) != 0U)
