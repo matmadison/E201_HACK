@@ -23,6 +23,8 @@
 
 /* USER CODE BEGIN INCLUDE */
 
+extern void APP_RequestPCReset(uint8_t encoder_mask);
+
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,12 +46,15 @@ static uint8_t active_cmd_state = 0U;
 static uint8_t active_cmd_count = 1U;
 static uint8_t stream_cmd_state = 0U;
 static uint8_t stream_cmd_value = 0U;
+static uint8_t reset_cmd_state = 0U;
+static uint8_t reset_cmd_mask = 0U;
 static uint8_t tune_cmd_state = 0U;
 static uint8_t tune_cmd_buf[5];
 
 #define ACTIVE_ENCODER_CMD_HEADER  0xC3U
 #define STREAM_CONTROL_CMD_HEADER  0xC4U
 #define USB_TUNING_CMD_HEADER      0xC5U
+#define PC_RESET_CMD_HEADER        0xC7U
 
 /* USER CODE END PV */
 
@@ -383,6 +388,26 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
         continue;
       }
 
+      /* C7 encoder_mask checksum.  This L151 board implements E1 only. */
+      if (reset_cmd_state == 1U)
+      {
+        reset_cmd_mask = b;
+        reset_cmd_state = 2U;
+        continue;
+      }
+      else if (reset_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((PC_RESET_CMD_HEADER ^ reset_cmd_mask) ^ 0xFFU);
+
+        if ((b == expected) && ((reset_cmd_mask & 0x01U) != 0U))
+        {
+          APP_RequestPCReset(0x01U);
+        }
+        reset_cmd_state = 0U;
+        continue;
+      }
+
       if (b == ACTIVE_ENCODER_CMD_HEADER)
       {
         active_cmd_state = 1U;
@@ -394,6 +419,10 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       else if (b == USB_TUNING_CMD_HEADER)
       {
         tune_cmd_state = 1U;
+      }
+      else if (b == PC_RESET_CMD_HEADER)
+      {
+        reset_cmd_state = 1U;
       }
     }
   }

@@ -74,6 +74,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 static uint8_t encoder_frame[10];
 static uint8_t timestamp_frame[6];
+static uint8_t pc_reset_event_frame[4];
 static uint8_t usb_tx_buffer[2][USB_TX_BUFFER_CAPACITY];
 static uint8_t usb_fill_buffer = 0U;
 static uint16_t usb_fill_length = 0U;
@@ -86,6 +87,7 @@ static uint32_t encoder_sense_last_ms = 0U;
 static uint32_t encoder_sense_filtered = 0U;
 static uint8_t encoder_sense_valid = 0U;
 static uint8_t encoder_connected = 0U;
+static volatile uint8_t pc_reset_pending_mask = 0U;
 
 /* USER CODE END PV */
 
@@ -101,15 +103,32 @@ static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms);
 static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
                                uint32_t now);
 static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush);
+static void USB_ApplyPendingResetAtBatchBoundary(uint32_t now);
 static void USB_StreamTask(void);
 static void APP_SetEncoderConnectedLED(uint8_t connected);
 static void APP_UpdateEncoderStatusLED(uint32_t now);
 static void APP_UpdateUsbStatusLED(uint32_t now);
+void APP_RequestPCReset(uint8_t encoder_mask);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void APP_RequestPCReset(uint8_t encoder_mask)
+{
+  /* Called from the USB receive callback.  Defer timer and stream changes to
+   * a USB batch boundary in the main loop. */
+  pc_reset_pending_mask |= (uint8_t)(encoder_mask & 0x01U);
+}
+
+static void APP_BuildPCResetEventFrame(uint8_t *frame, uint8_t encoder_mask)
+{
+  frame[0] = 0xABU;
+  frame[1] = 0x03U;
+  frame[2] = encoder_mask;
+  frame[3] = (uint8_t)(frame[0] ^ frame[1] ^ frame[2] ^ 0xFFU);
+}
 
 static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity)
 {
@@ -314,6 +333,38 @@ static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush)
   return 0U;
 }
 
+static void USB_ApplyPendingResetAtBatchBoundary(uint32_t now)
+{
+  uint8_t reset_mask;
+  uint32_t primask;
+
+  /* This function is called only at a USB batch boundary, rather than for
+   * every encoder frame. */
+  if ((pc_reset_pending_mask & 0x01U) == 0U)
+  {
+    return;
+  }
+
+  /* Clear the request atomically.  If another command arrives afterwards it
+   * remains pending for the following batch boundary. */
+  primask = __get_PRIMASK();
+  __disable_irq();
+  reset_mask = (uint8_t)(pc_reset_pending_mask & 0x01U);
+  pc_reset_pending_mask &= (uint8_t)~reset_mask;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if (reset_mask != 0U)
+  {
+    __HAL_TIM_SET_COUNTER(&htim2, 0U);
+    APP_BuildPCResetEventFrame(pc_reset_event_frame, reset_mask);
+    (void)USB_AppendFrame(pc_reset_event_frame,
+                          sizeof(pc_reset_event_frame), now);
+  }
+}
+
 static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
                                uint32_t now)
 {
@@ -362,6 +413,9 @@ static void USB_StreamTask(void)
     usb_fill_length = 0U;
     usb_fill_started_ms = 0U;
     encoder_frame_count = 0U;
+    USB_ApplyPendingResetAtBatchBoundary(now);
+    usb_fill_length = 0U;
+    usb_fill_started_ms = 0U;
     return;
   }
 
@@ -386,7 +440,13 @@ static void USB_StreamTask(void)
     }
   }
 
-  (void)USB_TryFlush(now, timestamp_sent);
+  if ((USB_TryFlush(now, timestamp_sent) != 0U) &&
+      (usb_fill_length == 0U))
+  {
+    /* A batch has just been accepted.  Any PC zero request is now applied
+     * before the next encoder sample is constructed. */
+    USB_ApplyPendingResetAtBatchBoundary(now);
+  }
 }
 
 /* USER CODE END 0 */
