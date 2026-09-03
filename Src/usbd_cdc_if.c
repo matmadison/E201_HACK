@@ -24,6 +24,8 @@
 /* USER CODE BEGIN INCLUDE */
 
 extern void APP_RequestPCReset(uint8_t encoder_mask);
+extern void APP_SetPhysicalReferenceResetMask(uint8_t encoder_mask);
+extern void APP_RequestTimestampInterval(uint32_t interval_frames);
 
 /* USER CODE END INCLUDE */
 
@@ -48,13 +50,19 @@ static uint8_t stream_cmd_state = 0U;
 static uint8_t stream_cmd_value = 0U;
 static uint8_t reset_cmd_state = 0U;
 static uint8_t reset_cmd_mask = 0U;
+static uint8_t reference_cmd_state = 0U;
+static uint8_t reference_cmd_mask = 0U;
+static uint8_t timestamp_cmd_state = 0U;
+static uint8_t timestamp_cmd_buf[4];
 static uint8_t tune_cmd_state = 0U;
 static uint8_t tune_cmd_buf[5];
 
 #define ACTIVE_ENCODER_CMD_HEADER  0xC3U
 #define STREAM_CONTROL_CMD_HEADER  0xC4U
 #define USB_TUNING_CMD_HEADER      0xC5U
+#define PHYSICAL_REFERENCE_CMD_HEADER 0xC6U
 #define PC_RESET_CMD_HEADER        0xC7U
+#define TIMESTAMP_INTERVAL_CMD_HEADER 0xC8U
 
 /* USER CODE END PV */
 
@@ -388,11 +396,69 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
         continue;
       }
 
+      /* C8 interval_0 interval_1 interval_2 interval_3 checksum */
+      if ((timestamp_cmd_state >= 1U) && (timestamp_cmd_state <= 4U))
+      {
+        timestamp_cmd_buf[timestamp_cmd_state - 1U] = b;
+        timestamp_cmd_state++;
+        continue;
+      }
+      else if (timestamp_cmd_state == 5U)
+      {
+        uint8_t expected = TIMESTAMP_INTERVAL_CMD_HEADER;
+        uint8_t k;
+        uint32_t interval;
+
+        for (k = 0U; k < 4U; k++)
+        {
+          expected ^= timestamp_cmd_buf[k];
+        }
+        expected ^= 0xFFU;
+
+        if (b == expected)
+        {
+          interval = (uint32_t)timestamp_cmd_buf[0] |
+                     ((uint32_t)timestamp_cmd_buf[1] << 8) |
+                     ((uint32_t)timestamp_cmd_buf[2] << 16) |
+                     ((uint32_t)timestamp_cmd_buf[3] << 24);
+          if (interval != 0U)
+          {
+            APP_RequestTimestampInterval(interval);
+          }
+        }
+
+        timestamp_cmd_state = 0U;
+        continue;
+      }
+
       /* C7 encoder_mask checksum.  This L151 board implements E1 only. */
       if (reset_cmd_state == 1U)
       {
         reset_cmd_mask = b;
         reset_cmd_state = 2U;
+        continue;
+      }
+
+      /* C6 encoder_mask checksum.  A set E1 bit resets on physical Z;
+       * a clear E1 bit reports the reference while continuing the count. */
+      if (reference_cmd_state == 1U)
+      {
+        reference_cmd_mask = b;
+        reference_cmd_state = 2U;
+        continue;
+      }
+      else if (reference_cmd_state == 2U)
+      {
+        uint8_t expected =
+            (uint8_t)((PHYSICAL_REFERENCE_CMD_HEADER ^
+                       reference_cmd_mask) ^ 0xFFU);
+
+        if (b == expected)
+        {
+          APP_SetPhysicalReferenceResetMask(
+              (uint8_t)(reference_cmd_mask & 0x01U));
+        }
+        reference_cmd_state = 0U;
         continue;
       }
       else if (reset_cmd_state == 2U)
@@ -420,9 +486,17 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       {
         tune_cmd_state = 1U;
       }
+      else if (b == PHYSICAL_REFERENCE_CMD_HEADER)
+      {
+        reference_cmd_state = 1U;
+      }
       else if (b == PC_RESET_CMD_HEADER)
       {
         reset_cmd_state = 1U;
+      }
+      else if (b == TIMESTAMP_INTERVAL_CMD_HEADER)
+      {
+        timestamp_cmd_state = 1U;
       }
     }
   }

@@ -35,9 +35,9 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define TIMESTAMP_INTERVAL_FRAMES  1000U
+#define DEFAULT_TIMESTAMP_INTERVAL_FRAMES 1000U
 #define USB_TX_BUFFER_CAPACITY     1024U
-#define LED_DIAGNOSTIC_INTERVAL_MS 1000U
+#define BACKGROUND_SERVICE_INTERVAL_MS 500U
 #define USB_LED_CHECK_INTERVAL_MS  1000U
 #define ENCODER_SENSE_INTERVAL_MS  1000U
 
@@ -74,13 +74,15 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 static uint8_t encoder_frame[10];
 static uint8_t timestamp_frame[6];
-static uint8_t pc_reset_event_frame[4];
+static uint8_t reference_event_frame[4];
 static uint8_t usb_tx_buffer[2][USB_TX_BUFFER_CAPACITY];
 static uint8_t usb_fill_buffer = 0U;
 static uint16_t usb_fill_length = 0U;
 static uint32_t usb_fill_started_ms = 0U;
-static uint32_t encoder_frame_count = 0U;
-static uint32_t led_diagnostic_last_ms = 0U;
+static uint32_t frames_until_timestamp = DEFAULT_TIMESTAMP_INTERVAL_FRAMES;
+static volatile uint32_t timestamp_interval_requested =
+    DEFAULT_TIMESTAMP_INTERVAL_FRAMES;
+static uint32_t background_service_last_ms = 0U;
 static uint32_t usb_led_last_check_ms = 0U;
 static uint8_t usb_led_configured = 0xFFU;
 static uint32_t encoder_sense_last_ms = 0U;
@@ -88,6 +90,9 @@ static uint32_t encoder_sense_filtered = 0U;
 static uint8_t encoder_sense_valid = 0U;
 static uint8_t encoder_connected = 0U;
 static volatile uint8_t pc_reset_pending_mask = 0U;
+static volatile uint8_t physical_reference_reset_mask = 0x01U;
+static volatile uint8_t physical_reference_event_type = 0U;
+static volatile uint16_t physical_reference_capture = 0U;
 
 /* USER CODE END PV */
 
@@ -103,12 +108,14 @@ static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms);
 static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
                                uint32_t now);
 static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush);
-static void USB_ApplyPendingResetAtBatchBoundary(uint32_t now);
+static void USB_ApplyPendingReferenceEventsAtBatchBoundary(uint32_t now);
 static void USB_StreamTask(void);
 static void APP_SetEncoderConnectedLED(uint8_t connected);
 static void APP_UpdateEncoderStatusLED(uint32_t now);
 static void APP_UpdateUsbStatusLED(uint32_t now);
 void APP_RequestPCReset(uint8_t encoder_mask);
+void APP_SetPhysicalReferenceResetMask(uint8_t encoder_mask);
+void APP_RequestTimestampInterval(uint32_t interval_frames);
 
 /* USER CODE END PFP */
 
@@ -122,10 +129,27 @@ void APP_RequestPCReset(uint8_t encoder_mask)
   pc_reset_pending_mask |= (uint8_t)(encoder_mask & 0x01U);
 }
 
-static void APP_BuildPCResetEventFrame(uint8_t *frame, uint8_t encoder_mask)
+void APP_SetPhysicalReferenceResetMask(uint8_t encoder_mask)
+{
+  physical_reference_reset_mask = (uint8_t)(encoder_mask & 0x01U);
+}
+
+void APP_RequestTimestampInterval(uint32_t interval_frames)
+{
+  if (interval_frames != 0U)
+  {
+    /* Consumed only when a timestamp interval is reloaded, avoiding a
+     * volatile PC-controlled read in every encoder frame. */
+    timestamp_interval_requested = interval_frames;
+  }
+}
+
+static void APP_BuildReferenceEventFrame(uint8_t *frame,
+                                         uint8_t event_type,
+                                         uint8_t encoder_mask)
 {
   frame[0] = 0xABU;
-  frame[1] = 0x03U;
+  frame[1] = event_type;
   frame[2] = encoder_mask;
   frame[3] = (uint8_t)(frame[0] ^ frame[1] ^ frame[2] ^ 0xFFU);
 }
@@ -333,35 +357,61 @@ static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush)
   return 0U;
 }
 
-static void USB_ApplyPendingResetAtBatchBoundary(uint32_t now)
+static void USB_ApplyPendingReferenceEventsAtBatchBoundary(uint32_t now)
 {
-  uint8_t reset_mask;
+  uint8_t pc_reset_mask;
+  uint8_t physical_event_type;
+  uint16_t physical_capture;
   uint32_t primask;
 
-  /* This function is called only at a USB batch boundary, rather than for
-   * every encoder frame. */
-  if ((pc_reset_pending_mask & 0x01U) == 0U)
+  /* Reference requests are consumed only at USB batch boundaries, keeping
+   * all request polling out of the per-frame streaming path. */
+  if (((pc_reset_pending_mask & 0x01U) == 0U) &&
+      (physical_reference_event_type == 0U))
   {
     return;
   }
 
-  /* Clear the request atomically.  If another command arrives afterwards it
-   * remains pending for the following batch boundary. */
+  /* Copy and clear the interrupt-owned request data atomically. */
   primask = __get_PRIMASK();
   __disable_irq();
-  reset_mask = (uint8_t)(pc_reset_pending_mask & 0x01U);
-  pc_reset_pending_mask &= (uint8_t)~reset_mask;
+  pc_reset_mask = (uint8_t)(pc_reset_pending_mask & 0x01U);
+  pc_reset_pending_mask &= (uint8_t)~pc_reset_mask;
+  physical_event_type = physical_reference_event_type;
+  physical_capture = physical_reference_capture;
+  physical_reference_event_type = 0U;
   if (primask == 0U)
   {
     __enable_irq();
   }
 
-  if (reset_mask != 0U)
+  if (physical_event_type != 0U)
+  {
+    if (physical_event_type == 0x01U)
+    {
+      uint16_t current_count =
+          (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+
+      /* Move all reference arithmetic to this batch boundary.  Loading the
+       * displacement since the captured Z edge preserves motion since the
+       * reference while keeping subtraction out of every encoder frame. */
+      __HAL_TIM_SET_COUNTER(
+          &htim2, (uint16_t)(current_count - physical_capture));
+    }
+
+    APP_BuildReferenceEventFrame(reference_event_frame,
+                                 physical_event_type, 0x01U);
+    (void)USB_AppendFrame(reference_event_frame,
+                          sizeof(reference_event_frame), now);
+  }
+
+  if (pc_reset_mask != 0U)
   {
     __HAL_TIM_SET_COUNTER(&htim2, 0U);
-    APP_BuildPCResetEventFrame(pc_reset_event_frame, reset_mask);
-    (void)USB_AppendFrame(pc_reset_event_frame,
-                          sizeof(pc_reset_event_frame), now);
+    APP_BuildReferenceEventFrame(reference_event_frame,
+                                 0x03U, pc_reset_mask);
+    (void)USB_AppendFrame(reference_event_frame,
+                          sizeof(reference_event_frame), now);
   }
 }
 
@@ -399,11 +449,24 @@ static void USB_StreamTask(void)
   uint32_t now = HAL_GetTick();
   uint8_t timestamp_sent = 0U;
 
-  /* Keep ADC/GPIO diagnostics out of the high-rate path.  The LEDs retain
-   * their previous states between these one-second checks. */
-  if ((now - led_diagnostic_last_ms) >= LED_DIAGNOSTIC_INTERVAL_MS)
+  /* One existing time comparison services low-priority commands within
+   * 500 ms and calls the separately rate-limited one-second LED checks. */
+  if ((now - background_service_last_ms) >=
+      BACKGROUND_SERVICE_INTERVAL_MS)
   {
-    led_diagnostic_last_ms = now;
+    if (((pc_reset_pending_mask & 0x01U) != 0U) ||
+        (physical_reference_event_type != 0U))
+    {
+      /* Preserve stream ordering: all pre-event samples must be submitted
+       * before the AB event and the first post-event encoder sample. */
+      if ((usb_fill_length != 0U) && (USB_TryFlush(now, 1U) == 0U))
+      {
+        return;
+      }
+      USB_ApplyPendingReferenceEventsAtBatchBoundary(now);
+    }
+
+    background_service_last_ms = now;
     APP_UpdateUsbStatusLED(now);
     APP_UpdateEncoderStatusLED(now);
   }
@@ -412,19 +475,29 @@ static void USB_StreamTask(void)
   {
     usb_fill_length = 0U;
     usb_fill_started_ms = 0U;
-    encoder_frame_count = 0U;
-    USB_ApplyPendingResetAtBatchBoundary(now);
+    frames_until_timestamp = timestamp_interval_requested;
+    USB_ApplyPendingReferenceEventsAtBatchBoundary(now);
     usb_fill_length = 0U;
     usb_fill_started_ms = 0U;
     return;
   }
 
-  if (encoder_frame_count >= TIMESTAMP_INTERVAL_FRAMES)
+  if (frames_until_timestamp == 0U)
   {
+    /* Use the existing timestamp boundary to service physical-reference and
+     * PC-zero requests.  Flush all pre-event samples first, then place any
+     * AB event ahead of the next encoder sample.  This avoids checking for
+     * pending commands at every USB batch boundary. */
+    if ((usb_fill_length != 0U) && (USB_TryFlush(now, 1U) == 0U))
+    {
+      return;
+    }
+
+    USB_ApplyPendingReferenceEventsAtBatchBoundary(now);
     APP_BuildTimestampFrame(timestamp_frame, now);
     if (USB_AppendFrame(timestamp_frame, sizeof(timestamp_frame), now) != 0U)
     {
-      encoder_frame_count = 0U;
+      frames_until_timestamp = timestamp_interval_requested;
       timestamp_sent = 1U;
     }
   }
@@ -436,17 +509,11 @@ static void USB_StreamTask(void)
     if ((frame_length != 0U) &&
         (USB_AppendFrame(encoder_frame, frame_length, now) != 0U))
     {
-      encoder_frame_count++;
+      frames_until_timestamp--;
     }
   }
 
-  if ((USB_TryFlush(now, timestamp_sent) != 0U) &&
-      (usb_fill_length == 0U))
-  {
-    /* A batch has just been accepted.  Any PC zero request is now applied
-     * before the next encoder sample is constructed. */
-    USB_ApplyPendingResetAtBatchBoundary(now);
-  }
+  (void)USB_TryFlush(now, timestamp_sent);
 }
 
 /* USER CODE END 0 */
@@ -504,7 +571,7 @@ int main(void)
   usb_fill_buffer = 0U;
   usb_fill_length = 0U;
   usb_fill_started_ms = 0U;
-  encoder_frame_count = 0U;
+  frames_until_timestamp = timestamp_interval_requested;
 
   /* USER CODE END 2 */
 
@@ -715,8 +782,15 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_2)
   {
-    /* Reset the live TIM2 encoder count on the rising edge of ENC_Z. */
-    __HAL_TIM_SET_COUNTER(&htim2, 0U);
+    /* Capture the exact Z-edge position.  The viewer's C6 mask determines
+     * whether this becomes a reset event (type 1) or continue event (type 2). */
+    if (physical_reference_event_type == 0U)
+    {
+      physical_reference_capture =
+          (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+      physical_reference_event_type =
+          ((physical_reference_reset_mask & 0x01U) != 0U) ? 0x01U : 0x02U;
+    }
   }
 }
 
