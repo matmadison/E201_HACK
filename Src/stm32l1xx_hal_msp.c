@@ -78,6 +78,44 @@ void HAL_MspInit(void)
 }
 
 /**
+  * @brief ADC MSP Initialization
+  * @param hadc: ADC handle pointer
+  * @retval None
+  */
+void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  if(hadc->Instance==ADC1)
+  {
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /**ADC1 GPIO Configuration
+    PB13     ------> ADC1_IN19
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  }
+}
+
+/**
+  * @brief ADC MSP De-Initialization
+  * @param hadc: ADC handle pointer
+  * @retval None
+  */
+void HAL_ADC_MspDeInit(ADC_HandleTypeDef* hadc)
+{
+  if(hadc->Instance==ADC1)
+  {
+    __HAL_RCC_ADC1_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_13);
+  }
+}
+
+/**
   * @brief TIM_Encoder MSP Initialization
   * This function configures the hardware resources used in this example
   * @param htim_encoder: TIM_Encoder handle pointer
@@ -146,4 +184,3 @@ void HAL_TIM_Encoder_MspDeInit(TIM_HandleTypeDef* htim_encoder)
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
-

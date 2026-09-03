@@ -35,11 +35,21 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define TIMESTAMP_INTERVAL_FRAMES  1000U
 #define USB_TX_BUFFER_CAPACITY     1024U
-#define COUNTER_EVENT_HEADER       0xABU
-#define COUNTER_EVENT_PHYSICAL_RESET     1U
-#define COUNTER_EVENT_PHYSICAL_NO_RESET  2U
-#define COUNTER_EVENT_PC_RESET           3U
+#define LED_DIAGNOSTIC_INTERVAL_MS 1000U
+#define USB_LED_CHECK_INTERVAL_MS  1000U
+#define ENCODER_SENSE_INTERVAL_MS  1000U
+
+/* 12-bit ADC thresholds for the measured PB13 levels:
+ * approximately 0 counts unplugged and 166 counts connected. */
+#define ENCODER_CONNECT_ADC         100U
+#define ENCODER_DISCONNECT_ADC       50U
+
+#define LED_USB_RED_PIN            GPIO_PIN_6
+#define LED_USB_GREEN_PIN          GPIO_PIN_7
+#define LED_ENCODER_GREEN_PIN      GPIO_PIN_8
+#define LED_ENCODER_RED_PIN        GPIO_PIN_9
 
 /* USER CODE END PD */
 
@@ -49,6 +59,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
@@ -58,35 +70,41 @@ extern volatile uint8_t usb_stream_enabled;
 extern volatile uint16_t usb_tx_batch_size;
 extern volatile uint16_t usb_flush_threshold;
 extern volatile uint8_t usb_force_flush_ms;
-extern volatile uint32_t timestamp_interval_frames;
+extern USBD_HandleTypeDef hUsbDeviceFS;
 
 static uint8_t encoder_frame[10];
 static uint8_t timestamp_frame[6];
-static uint8_t counter_event_frame[4];
 static uint8_t usb_tx_buffer[2][USB_TX_BUFFER_CAPACITY];
 static uint8_t usb_fill_buffer = 0U;
 static uint16_t usb_fill_length = 0U;
 static uint32_t usb_fill_started_ms = 0U;
 static uint32_t encoder_frame_count = 0U;
-static volatile uint8_t reference_reset_enabled = 1U;
-static volatile uint8_t counter_event_pending = 0U;
-static volatile uint8_t counter_event_type = 0U;
+static uint32_t led_diagnostic_last_ms = 0U;
+static uint32_t usb_led_last_check_ms = 0U;
+static uint8_t usb_led_configured = 0xFFU;
+static uint32_t encoder_sense_last_ms = 0U;
+static uint32_t encoder_sense_filtered = 0U;
+static uint8_t encoder_sense_valid = 0U;
+static uint8_t encoder_connected = 0U;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+static void MX_ADC1_Init(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity);
 static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms);
-static void APP_BuildCounterEventFrame(uint8_t *frame, uint8_t event_type);
 static uint8_t USB_AppendFrame(const uint8_t *frame, uint16_t length,
                                uint32_t now);
 static uint8_t USB_TryFlush(uint32_t now, uint8_t force_flush);
 static void USB_StreamTask(void);
+static void APP_SetEncoderConnectedLED(uint8_t connected);
+static void APP_UpdateEncoderStatusLED(uint32_t now);
+static void APP_UpdateUsbStatusLED(uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -131,6 +149,105 @@ static uint16_t APP_BuildEncoderFrame(uint8_t *frame, uint16_t capacity)
   return frame_length;
 }
 
+static void APP_SetEncoderConnectedLED(uint8_t connected)
+{
+  if (connected != 0U)
+  {
+    HAL_GPIO_WritePin(GPIOA, LED_ENCODER_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_ENCODER_GREEN_PIN, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(GPIOA, LED_ENCODER_GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_ENCODER_RED_PIN, GPIO_PIN_SET);
+  }
+}
+
+static void APP_UpdateEncoderStatusLED(uint32_t now)
+{
+  uint32_t sample;
+  uint8_t new_state = encoder_connected;
+
+  if ((encoder_sense_valid != 0U) &&
+      ((now - encoder_sense_last_ms) < ENCODER_SENSE_INTERVAL_MS))
+  {
+    return;
+  }
+  encoder_sense_last_ms = now;
+
+  if (HAL_ADC_Start(&hadc1) != HAL_OK)
+  {
+    encoder_connected = 0U;
+    APP_SetEncoderConnectedLED(0U);
+    return;
+  }
+
+  if (HAL_ADC_PollForConversion(&hadc1, 1U) != HAL_OK)
+  {
+    (void)HAL_ADC_Stop(&hadc1);
+    encoder_connected = 0U;
+    APP_SetEncoderConnectedLED(0U);
+    return;
+  }
+
+  sample = HAL_ADC_GetValue(&hadc1);
+  (void)HAL_ADC_Stop(&hadc1);
+
+  /* At a one-second sample interval the 100/50-count hysteresis provides
+   * adequate noise rejection without delaying an LED change for seconds. */
+  encoder_sense_filtered = sample;
+  encoder_sense_valid = 1U;
+
+  /* Hysteresis prevents flicker if the signal sits near a threshold. */
+  if ((encoder_connected == 0U) &&
+      (encoder_sense_filtered >= ENCODER_CONNECT_ADC))
+  {
+    new_state = 1U;
+  }
+  else if ((encoder_connected != 0U) &&
+           (encoder_sense_filtered <= ENCODER_DISCONNECT_ADC))
+  {
+    new_state = 0U;
+  }
+
+  if (new_state != encoder_connected)
+  {
+    encoder_connected = new_state;
+    APP_SetEncoderConnectedLED(encoder_connected);
+  }
+}
+
+static void APP_UpdateUsbStatusLED(uint32_t now)
+{
+  uint8_t configured;
+
+  if ((usb_led_configured != 0xFFU) &&
+      ((now - usb_led_last_check_ms) < USB_LED_CHECK_INTERVAL_MS))
+  {
+    return;
+  }
+
+  usb_led_last_check_ms = now;
+  configured = (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) ? 1U : 0U;
+
+  if (configured == usb_led_configured)
+  {
+    return;
+  }
+
+  usb_led_configured = configured;
+  if (configured != 0U)
+  {
+    HAL_GPIO_WritePin(GPIOA, LED_USB_RED_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_USB_GREEN_PIN, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(GPIOA, LED_USB_GREEN_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_USB_RED_PIN, GPIO_PIN_SET);
+  }
+}
+
 static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms)
 {
   uint8_t checksum = 0U;
@@ -147,18 +264,6 @@ static void APP_BuildTimestampFrame(uint8_t *frame, uint32_t tick_ms)
     checksum ^= frame[i];
   }
   frame[5] = (uint8_t)(checksum ^ 0xFFU);
-}
-
-static void APP_BuildCounterEventFrame(uint8_t *frame, uint8_t event_type)
-{
-  uint8_t checksum;
-
-  /* AB event_type encoder_mask checksum.  This L151 board has E1 only. */
-  frame[0] = COUNTER_EVENT_HEADER;
-  frame[1] = event_type;
-  frame[2] = 0x01U;
-  checksum = (uint8_t)(frame[0] ^ frame[1] ^ frame[2]);
-  frame[3] = (uint8_t)(checksum ^ 0xFFU);
 }
 
 static uint16_t USB_GetBatchSize(void)
@@ -242,7 +347,15 @@ static void USB_StreamTask(void)
 {
   uint32_t now = HAL_GetTick();
   uint8_t timestamp_sent = 0U;
-  uint8_t pending_event_type = 0U;
+
+  /* Keep ADC/GPIO diagnostics out of the high-rate path.  The LEDs retain
+   * their previous states between these one-second checks. */
+  if ((now - led_diagnostic_last_ms) >= LED_DIAGNOSTIC_INTERVAL_MS)
+  {
+    led_diagnostic_last_ms = now;
+    APP_UpdateUsbStatusLED(now);
+    APP_UpdateEncoderStatusLED(now);
+  }
 
   if (usb_stream_enabled == 0U)
   {
@@ -252,30 +365,7 @@ static void USB_StreamTask(void)
     return;
   }
 
-  /* Counter events are inserted before the first post-event encoder sample. */
-  __disable_irq();
-  if (counter_event_pending != 0U)
-  {
-    pending_event_type = counter_event_type;
-    counter_event_pending = 0U;
-  }
-  __enable_irq();
-
-  if (pending_event_type != 0U)
-  {
-    APP_BuildCounterEventFrame(counter_event_frame, pending_event_type);
-    if (USB_AppendFrame(counter_event_frame, sizeof(counter_event_frame), now) == 0U)
-    {
-      __disable_irq();
-      counter_event_type = pending_event_type;
-      counter_event_pending = 1U;
-      __enable_irq();
-    }
-    (void)USB_TryFlush(now, 1U);
-    return;
-  }
-
-  if (encoder_frame_count >= timestamp_interval_frames)
+  if (encoder_frame_count >= TIMESTAMP_INTERVAL_FRAMES)
   {
     APP_BuildTimestampFrame(timestamp_frame, now);
     if (USB_AppendFrame(timestamp_frame, sizeof(timestamp_frame), now) != 0U)
@@ -330,6 +420,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  APP_SetEncoderConnectedLED(0U);
+  APP_UpdateUsbStatusLED(HAL_GetTick());
+  MX_ADC1_Init();
   MX_TIM2_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
@@ -383,8 +476,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE |
+                                     RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
@@ -404,6 +500,45 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  hadc1.Init.LowPowerAutoWait = ADC_AUTOWAIT_DISABLE;
+  hadc1.Init.LowPowerAutoPowerOff = ADC_AUTOPOWEROFF_DISABLE;
+  hadc1.Init.ChannelsBank = ADC_CHANNELS_BANK_A;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfDiscConversion = 1;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_19;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_384CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -478,6 +613,20 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
 
+  /* Start all four active-high LED channels switched off. */
+  HAL_GPIO_WritePin(GPIOA,
+                    LED_USB_RED_PIN | LED_USB_GREEN_PIN |
+                    LED_ENCODER_GREEN_PIN | LED_ENCODER_RED_PIN,
+                    GPIO_PIN_RESET);
+
+  /* Configure PA6, PA7, PA8 and PA9 as status LED outputs. */
+  GPIO_InitStruct.Pin = LED_USB_RED_PIN | LED_USB_GREEN_PIN |
+                        LED_ENCODER_GREEN_PIN | LED_ENCODER_RED_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PB10 */
   GPIO_InitStruct.Pin = GPIO_PIN_10;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
@@ -502,39 +651,12 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void APP_SetReferenceResetEnabled(uint8_t enabled)
-{
-  reference_reset_enabled = (enabled != 0U) ? 1U : 0U;
-}
-
-void APP_ResetEncoderFromPC(void)
-{
-  uint32_t interrupt_was_disabled = __get_PRIMASK();
-
-  __disable_irq();
-  __HAL_TIM_SET_COUNTER(&htim2, 0U);
-  counter_event_type = COUNTER_EVENT_PC_RESET;
-  counter_event_pending = 1U;
-  if (interrupt_was_disabled == 0U)
-  {
-    __enable_irq();
-  }
-}
-
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == GPIO_PIN_2)
   {
-    if (reference_reset_enabled != 0U)
-    {
-      __HAL_TIM_SET_COUNTER(&htim2, 0U);
-      counter_event_type = COUNTER_EVENT_PHYSICAL_RESET;
-    }
-    else
-    {
-      counter_event_type = COUNTER_EVENT_PHYSICAL_NO_RESET;
-    }
-    counter_event_pending = 1U;
+    /* Reset the live TIM2 encoder count on the rising edge of ENC_Z. */
+    __HAL_TIM_SET_COUNTER(&htim2, 0U);
   }
 }
 
